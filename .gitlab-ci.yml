@@ -1,0 +1,111 @@
+stages:
+  - prepare
+  - infra-deploy
+  - app-build
+  - app-testing
+  - app-deploy
+  - post-deploy-testing
+
+prepare:
+  stage: prepare
+  image: centos:7
+  script:
+    - echo "Setting up S3 bucket & dynamoDB tables for tf state"
+    - yum install -y yum-utils
+    - yum-config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+    - yum -y install terraform
+    - cd terraform/setup
+    - terraform init
+    - export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+    - export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+    - terraform plan -var "aws_access_key=${AWS_ACCESS_KEY_ID}" -var "aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}" -out=tfplan
+    - terraform apply -input=false tfplan
+
+infra-deploy:
+  stage: infra-deploy
+  image: centos:7
+  script:
+    - echo "Creating infrastructure for application including EC2, RDS & S3"
+    - yum install -y yum-utils
+    - yum-config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+    - yum -y install terraform
+    - cd terraform/infra
+    - terraform init
+    - export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+    - export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+    - export RDS_PASSWORD="$RDS_PASSWORD"
+    - terraform plan -var "aws_access_key=${AWS_ACCESS_KEY_ID}" -var "aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}" -var "rds_password=${RDS_PASSWORD}" -out=tfplan
+    - terraform apply -input=false tfplan
+    - PUBLIC_IP=$(terraform output public_ip)
+    - echo $PUBLIC_IP > public_ip.txt
+  artifacts:
+    paths:
+      - terraform/infra/public_ip.txt
+
+app-build:
+  stage: app-build
+  image: ubuntu
+  script:
+    - echo "Building the application"
+    - PUBLIC_IP=$(cat terraform/infra/public_ip.txt)
+    - cleaned_public_ip=$(echo "$PUBLIC_IP" | sed 's/"//g')
+    - PUBLIC_IP=$cleaned_public_ip
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - echo "$EC2_PRIVATE_KEY" >> "key.pem"
+    - chmod 600 key.pem
+    - ssh -T -i key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<EOF
+    - mkdir -p /home/ec2-user/node-api && cd /home/ec2-user/node-api
+    - curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
+    - . ~/.nvm/nvm.sh   
+    - nvm install 16.15.1
+    - EOF
+    - scp -i key.pem -o StrictHostKeyChecking=no -r app/* "ec2-user@$PUBLIC_IP:/home/ec2-user/node-api"
+    - ssh -T -i key.pem -o StrictHostKeyChecking=no ec2-user@"$PUBLIC_IP" "cd /home/ec2-user/node-api && npm install"
+
+app-testing:
+  stage: app-testing
+  image: ubuntu
+  script:
+    - echo "Testing the application files"
+    - PUBLIC_IP=$(cat terraform/infra/public_ip.txt)
+    - cleaned_public_ip=$(echo "$PUBLIC_IP" | sed 's/"//g')
+    - PUBLIC_IP=$cleaned_public_ip
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - echo "$EC2_PRIVATE_KEY" >> "key.pem"
+    - chmod 600 key.pem
+    - scp -i key.pem -o StrictHostKeyChecking=no -r testing/* "ec2-user@$PUBLIC_IP:/home/ec2-user/"
+    - ssh -T -i key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<EOF
+    - bash /home/ec2-user/test.sh
+    - EOF
+
+app-deploy:
+  stage: app-deploy
+  image: ubuntu
+  script:
+    - echo "Deploying the application"
+    - PUBLIC_IP=$(cat terraform/infra/public_ip.txt)
+    - cleaned_public_ip=$(echo "$PUBLIC_IP" | sed 's/"//g')
+    - PUBLIC_IP=$cleaned_public_ip
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - echo "$EC2_PRIVATE_KEY" >> "key.pem"
+    - chmod 600 key.pem
+    - ssh -T -i key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<EOF
+    - cd /home/ec2-user/node-api
+    - node app.js > /dev/null 2>&1 &
+    - EOF
+
+post-deploy-testing:
+  stage: post-deploy-testing
+  image: ubuntu
+  script:
+    - echo "Post Deploy testing"
+    - apt-get update -qy
+    - apt-get install -y curl
+    - PUBLIC_IP=$(cat terraform/infra/public_ip.txt)
+    - cleaned_public_ip=$(echo "$PUBLIC_IP" | sed 's/"//g')
+    - PUBLIC_IP=$cleaned_public_ip
+    - curl http://$PUBLIC_IP:8080
+
